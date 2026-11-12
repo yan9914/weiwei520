@@ -407,11 +407,16 @@ def model_tables(m):
 
 
 # ---------------------------------------------------------------
-# 3. 整月建議價格
-#    Lagrange：Σ p·S + μ·[Σ (p-T)·S + B] = (1+μ)·Σ (p-θ)·S + 常數，θ = T·μ/(1+μ)
-#    → 整個月只有一個 θ；每個 (入住日, 房型) 各自最大化 (p-θ)·S(p)
-#      再調整 θ 讓 Σ (p-T)·S剩餘 + B ≥ 0，B = Σ已成交 (成交價 - T)
+# 3. 建議價格（日期區間可跨月；平均價限制可有可無，計算區間可自訂）
+#    Lagrange：Σ p·S + μ·[Σ_{計算區間} (p-T)·S + B]
+#    → 計算區間內的晚上：最大化 (p-θ)·S(p)，θ = T·μ/(1+μ)（所有晚上共用一個 θ）
+#      計算區間外的晚上：最大化 p·S(p)（等於 θ = 0）
+#      調整 θ 讓 Σ_{計算區間} (p-T)·S剩餘 + B ≥ 0，B = Σ_{計算區間已成交} (成交價 - T)
 # ---------------------------------------------------------------
+MAX_DAYS = 366
+MAX_CELLS = 10_000_000          # 日期數 × 所有房型價格網格點數的上限（避免雲端記憶體不足）
+
+
 def expected_min(lam, R, rmax):
     """E[min(D, R)] = Σ_{k=0}^{R-1} P(D > k)。"""
     pmf = np.exp(-lam)
@@ -424,18 +429,38 @@ def expected_min(lam, R, rmax):
     return out
 
 
-def price_month(model, holidays, year, month, today, otb, target, buffer, step, bounds=None):
-    """回傳 dict：price_table, detail, summary, warnings。金額單位：元。"""
+def _date_range(a, b):
+    return [a + k * ONE for k in range((b - a).days + 1)]
+
+
+def price_range(model, holidays, start, end, today, otb, step, bounds=None,
+                target=None, buffer=0, window=None):
+    """
+    start, end : 定價日期區間（含頭尾）
+    target     : 平均成交價目標（元）；None = 不設限，只做營收最大化
+    window     : 平均價計算區間 (起, 迄)；None = 與定價區間相同
+    回傳 dict：price_table, detail, summary, warnings。金額單位：元。
+    """
+    if end < start:
+        raise InputError("定價區間的結束日早於開始日。")
     K, names, cap = len(model.names), model.names, model.cap
-    cal = Calendar(holidays)
-    first = dt.date(year, month, 1)
-    nxt = dt.date(year + (month == 12), month % 12 + 1, 1)
-    dates = [first + k * ONE for k in range((nxt - first).days)]
+    use_target = target is not None
+    P_dates = _date_range(start, end)
+    W_dates = _date_range(*window) if (use_target and window) else (P_dates if use_target else [])
+    if use_target and window and window[1] < window[0]:
+        raise InputError("平均價計算區間的結束日早於開始日。")
+    dates = sorted(set(P_dates) | set(W_dates))
+    if (dates[-1] - dates[0]).days + 1 > MAX_DAYS:
+        raise InputError(f"定價區間與平均價計算區間合計跨越超過 {MAX_DAYS} 天，請縮短區間。")
     D = len(dates)
+    in_P = np.isin(dates, P_dates)
+    in_W = np.isin(dates, W_dates)
+    cal = Calendar(holidays)
     months, ntypes = cal.features(dates)
     z = model.ctrl(months, ntypes)
     warnings = []
 
+    # 目前訂房
     sold, rev = np.zeros((D, K)), np.zeros((D, K))
     if otb is not None:
         o = otb[otb["入住日"].isin(dates)]
@@ -445,15 +470,21 @@ def price_month(model, holidays, year, month, today, otb, target, buffer, step, 
             sold[di[row["入住日"]], ri[row["房型"]]] = row["已售房數"]
             rev[di[row["入住日"]], ri[row["房型"]]] = row["已售營收"] / 1000
         if len(o) == 0:
-            warnings.append("「目前訂房」裡沒有這個月份的資料，視為還沒有任何訂房。")
+            warnings.append("「目前訂房」裡沒有這些日期的資料，視為還沒有任何訂房。")
     remaining = np.maximum(cap[None] - sold, 0)
     L = np.array([(d - today).days for d in dates])
     past = L < 0
     open_ = (~past)[:, None] & (remaining > 0)
     if (L > LMAX).any():
         warnings.append(f"有 {int((L > LMAX).sum())} 個入住日距今超過 {LMAX} 天，視為整個預訂期都還沒開始。")
+    if use_target and (in_W & past).any() and otb is None:
+        warnings.append("平均價計算區間包含已經過去的日期，但沒有「目前訂房」資料，這些日期會被當成沒有成交。")
+    w_only = in_W & ~in_P & ~past
+    if w_only.any():
+        warnings.append(f"平均價計算區間有 {int(w_only.sum())} 個未來日期不在定價區間內。"
+                        "為了估計整段區間的平均價，這些日期也一起規劃了價格（表中標示為「只計入平均價」）。")
 
-    # 價格網格
+    # 價格網格（每個房型分開，元 → 千元）
     bounds = bounds or {}
     grids = []
     for i, n in enumerate(names):
@@ -466,108 +497,120 @@ def price_month(model, holidays, year, month, today, otb, target, buffer, step, 
             warnings.append(f"{n} 的價格範圍超出歷史價格（{model.p_lo[i]*1000:,.0f}–{model.p_hi[i]*1000:,.0f}），"
                             "超出的部分是模型外推，可信度較低。")
         g = np.arange(np.ceil(lo / step) * step, hi + 1e-6, step)
-        if len(g) == 0:
-            g = np.array([lo])
-        grids.append(g / 1000)
-    NG = max(len(g) for g in grids)
-    GRID = np.full((K, NG), np.nan)
-    for i, g in enumerate(grids):
-        GRID[i, :len(g)] = g
-    PC = GRID - model.p_bar[:, None]
-    LEVEL = np.exp(model.A[:, None] + model.B1[:, None] * PC + model.B2[:, None] * PC**2)
+        grids.append((g if len(g) else np.array([lo])) / 1000)
+    cells = D * sum(len(g) for g in grids)
+    if cells > MAX_CELLS:
+        raise InputError(f"計算量太大（{cells:,} 個價格組合）。請加大價格級距或縮短日期區間。")
+
+    # 每個房型：每晚 × 每個候選價格 的預期剩餘成交數
     CUM = np.cumsum(np.exp(XH @ model.H.T).T, axis=1)                 # K × 91
-
     Lc = np.clip(L, 0, LMAX)
-    lam = LEVEL[None] * np.exp(z)[:, None, None] * CUM[:, Lc].T[:, :, None]
-    S = expected_min(np.nan_to_num(lam), remaining[:, :, None], cap.max())
-    S[~open_] = 0.0
-    S = np.where(np.isnan(GRID)[None], np.nan, S)
+    S_list = []
+    for i in range(K):
+        pc = grids[i] - model.p_bar[i]
+        level = np.exp(model.A[i] + model.B1[i] * pc + model.B2[i] * pc**2)
+        lam = level[None] * (np.exp(z) * CUM[i, Lc])[:, None]
+        Si = expected_min(lam, remaining[:, i][:, None], cap[i])
+        Si[~open_[:, i]] = 0.0
+        S_list.append(Si)
 
-    T = (target + buffer) / 1000
-    B = rev.sum() - T * sold.sum()
+    T = (target + buffer) / 1000 if use_target else 0.0
+    B = (rev[in_W].sum() - T * sold[in_W].sum()) if use_target else 0.0
+    rows_ = np.arange(D)
 
     def choose(th):
-        obj = np.where(np.isnan(S), -np.inf, (GRID[None] - th) * np.nan_to_num(S))
-        j = obj.argmax(-1)
-        p = np.take_along_axis(np.broadcast_to(GRID, S.shape), j[..., None], -1)[..., 0]
-        s = np.take_along_axis(np.nan_to_num(S), j[..., None], -1)[..., 0]
+        th_d = np.where(in_W, th, 0.0)[:, None]
+        p, s = np.zeros((D, K)), np.zeros((D, K))
+        for i in range(K):
+            j = ((grids[i][None] - th_d) * S_list[i]).argmax(1)
+            p[:, i], s[:, i] = grids[i][j], S_list[i][rows_, j]
         return p, s
 
     def gap(th):
         p, s = choose(th)
-        return ((p - T) * s).sum() + B
+        return ((p - T) * s)[in_W].sum() + B
 
-    feasible = True
-    if gap(0.0) >= 0:
-        theta = 0.0
-    elif gap(T) < 0:
-        theta, feasible = T, False
-        warnings.append("在目前的價格範圍內，預期全月平均價追不到目標。建議價格已經盡量拉高平均價；"
-                        "可以考慮放寬價格上限，或重新檢視目標。")
-    else:
-        lo_, hi_ = 0.0, T
-        for _ in range(25):
-            mid = (lo_ + hi_) / 2
-            lo_, hi_ = (mid, hi_) if gap(mid) < 0 else (lo_, mid)
-        theta = hi_
+    feasible, theta = True, 0.0
+    if use_target and gap(0.0) < 0:
+        if gap(T) < 0:
+            theta, feasible = T, False
+            warnings.append("在目前的價格範圍內，預期平均價追不到目標。建議價格已經盡量拉高平均價；"
+                            "可以考慮放寬價格上限，或重新檢視目標。")
+        else:
+            lo_, hi_ = 0.0, T
+            for _ in range(30):
+                mid = (lo_ + hi_) / 2
+                lo_, hi_ = (mid, hi_) if gap(mid) < 0 else (lo_, mid)
+            theta = hi_
     P, Sx = choose(theta)
     P0, S0 = choose(0.0)
 
-    # 輸出表格
-    at_lo = open_ & np.isclose(P, GRID[:, 0][None]) & (np.array([len(g) for g in grids])[None] > 1)
-    at_hi = open_ & np.isclose(P, np.array([g[-1] for g in grids])[None]) & (np.array([len(g) for g in grids])[None] > 1)
-    if at_hi.any():
-        cells = [f"{dates[d].strftime('%m/%d')} {names[i]}" for d, i in zip(*np.nonzero(at_hi))]
-        warnings.append(f"{len(cells)} 格的建議價碰到價格上限（例如 {'、'.join(cells[:3])}），"
-                        "代表模型認為還可以再漲，但已超出可信範圍，請人工確認。")
-    if at_lo.any():
-        cells = [f"{dates[d].strftime('%m/%d')} {names[i]}" for d, i in zip(*np.nonzero(at_lo))]
-        warnings.append(f"{len(cells)} 格的建議價碰到價格下限（例如 {'、'.join(cells[:3])}），請人工確認。")
+    # 碰到價格邊界的提醒（只看定價區間）
+    multi = np.array([len(g) > 1 for g in grids])[None]
+    show = open_ & in_P[:, None] & multi
+    for mask, word in [(show & np.isclose(P, np.array([g[-1] for g in grids])[None]), "上限"),
+                       (show & np.isclose(P, np.array([g[0] for g in grids])[None]), "下限")]:
+        if mask.any():
+            ex = [f"{dates[d].strftime('%m/%d')} {names[i]}" for d, i in zip(*np.nonzero(mask))]
+            tail = "代表模型認為還可以再漲，但已超出可信範圍，" if word == "上限" else ""
+            warnings.append(f"{len(ex)} 格的建議價碰到價格{word}（例如 {'、'.join(ex[:3])}），{tail}請人工確認。")
 
+    # 建議價格表
+    usage = []
+    for d in range(D):
+        if in_P[d] and in_W[d]:
+            usage.append("定價 + 計入平均價")
+        elif in_P[d]:
+            usage.append("定價")
+        else:
+            usage.append("只計入平均價")
     table = pd.DataFrame({"入住日": [d.isoformat() for d in dates],
                           "星期": [WEEKDAYS[d.weekday()] for d in dates],
                           "夜晚類型": [NIGHT_TYPES[t] for t in ntypes]})
+    if use_target:
+        table["用途"] = usage
     for i, n in enumerate(names):
-        col = []
-        for d in range(D):
-            if past[d]:
-                col.append("已過")
-            elif remaining[d, i] == 0:
-                col.append("售完")
-            else:
-                col.append(int(round(P[d, i] * 1000)))
-        table[n] = col
+        table[n] = ["已過" if past[d] else "售完" if remaining[d, i] == 0 else int(round(P[d, i] * 1000))
+                    for d in range(D)]
 
-    rows = []
-    for d in range(D):
-        for i, n in enumerate(names):
-            rows.append({"入住日": dates[d].isoformat(), "房型": n, "距入住天數": int(L[d]),
-                         "已售房數": int(sold[d, i]), "剩餘房數": int(remaining[d, i]),
-                         "建議價": int(round(P[d, i] * 1000)) if open_[d, i] else None,
-                         "預期再售出": round(float(Sx[d, i]), 2),
-                         "預期新增營收": int(round(P[d, i] * Sx[d, i] * 1000)) if open_[d, i] else 0})
-    detail = pd.DataFrame(rows)
+    detail = pd.DataFrame([{"入住日": dates[d].isoformat(), "房型": n, "用途": usage[d] if use_target else "定價",
+                            "距入住天數": int(L[d]), "已售房數": int(sold[d, i]), "剩餘房數": int(remaining[d, i]),
+                            "建議價": int(round(P[d, i] * 1000)) if open_[d, i] else None,
+                            "預期再售出": round(float(Sx[d, i]), 2),
+                            "預期新增營收": int(round(P[d, i] * Sx[d, i] * 1000)) if open_[d, i] else 0}
+                           for d in range(D) for i, n in enumerate(names)])
 
-    otb_rooms, otb_rev = sold.sum(), rev.sum() * 1000
-    exp_rooms = otb_rooms + Sx.sum()
-    exp_rev = otb_rev + (P * Sx).sum() * 1000
-    free_rooms = otb_rooms + S0.sum()
-    free_rev = otb_rev + (P0 * S0).sum() * 1000
-    summary = {
-        "已成交房數": int(otb_rooms),
-        "已成交平均價": otb_rev / otb_rooms if otb_rooms else None,
-        "目前盈餘 B": B * 1000,
-        "θ（每間房的虛擬成本）": theta * 1000,
-        "預期全月房數": exp_rooms,
-        "預期全月營收": exp_rev,
-        "預期全月平均價": exp_rev / exp_rooms if exp_rooms else None,
-        "不設限時預期營收": free_rev,
-        "不設限時預期平均價": free_rev / free_rooms if free_rooms else None,
-        "計算用的平均價目標": target + buffer,
-        "可達成": feasible,
-    }
+    def totals(mask, p, s):
+        rooms = sold[mask].sum() + s[mask].sum()
+        money = (rev[mask].sum() + (p * s)[mask].sum()) * 1000
+        return rooms, money, (money / rooms if rooms else None)
+
+    pr, pm, pa = totals(in_P, P, Sx)
+    fr, fm, fa = totals(in_P, P0, S0)
+    summary = {"定價區間": f"{start} ～ {end}（{len(P_dates)} 晚）",
+               "定價區間：已成交房數": int(sold[in_P].sum()),
+               "定價區間：預期總房數": pr,
+               "定價區間：預期總營收": pm,
+               "定價區間：預期平均價": pa}
+    if use_target:
+        wr, wm, wa = totals(in_W, P, Sx)
+        _, _, wfa = totals(in_W, P0, S0)
+        ws = sold[in_W].sum()
+        summary.update({
+            "平均價計算區間": f"{W_dates[0]} ～ {W_dates[-1]}（{len(W_dates)} 晚）",
+            "平均價目標": target,
+            "計算用目標（含緩衝）": target + buffer,
+            "計算區間：已成交房數": int(ws),
+            "計算區間：已成交平均價": rev[in_W].sum() * 1000 / ws if ws else None,
+            "目前盈餘 B": B * 1000,
+            "θ（每間房的虛擬成本）": theta * 1000,
+            "計算區間：預期平均價": wa,
+            "不設限時：計算區間預期平均價": wfa,
+            "不設限時：定價區間預期營收": fm,
+            "可達成": feasible,
+        })
     return dict(price_table=table, detail=detail, summary=summary, warnings=warnings,
-                month=f"{year}-{month:02d}", today=today.isoformat())
+                start=start.isoformat(), end=end.isoformat(), today=today.isoformat(), use_target=use_target)
 
 
 # ---------------------------------------------------------------
@@ -578,8 +621,8 @@ def to_excel(result, model):
 
     s = result["summary"]
     fmt = lambda v: "—" if v is None else (f"{v:,.0f}" if isinstance(v, (int, float, np.floating)) and not isinstance(v, bool) else v)
-    summ = pd.DataFrame({"項目": ["定價月份", "計算日期"] + list(s),
-                         "數值": [result["month"], result["today"]]
+    summ = pd.DataFrame({"項目": ["計算日期", "是否設定平均價目標"] + list(s),
+                         "數值": [result["today"], "是" if result["use_target"] else "否（只做營收最大化）"]
                          + [("是" if v else "否") if isinstance(v, bool) else fmt(v) for v in s.values()]})
     warn = pd.DataFrame({"提醒": result["warnings"] + model.notes or ["（無）"]})
     price, night, month = model_tables(model)
@@ -588,7 +631,7 @@ def to_excel(result, model):
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         result["price_table"].to_excel(xw, sheet_name="建議價格", index=False)
         result["detail"].to_excel(xw, sheet_name="預測明細", index=False)
-        summ.to_excel(xw, sheet_name="月度摘要", index=False)
+        summ.to_excel(xw, sheet_name="摘要", index=False)
         warn.to_excel(xw, sheet_name="提醒", index=False)
         price.to_excel(xw, sheet_name="模型_價格效果", index=False)
         night.to_excel(xw, sheet_name="模型_夜晚類型", index=False)
