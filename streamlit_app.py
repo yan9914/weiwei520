@@ -9,11 +9,16 @@
 """
 import datetime as dt
 import hashlib
+import importlib
 from pathlib import Path
 
 import streamlit as st
 
 import pricing_core as pc
+
+# Streamlit Cloud 從 GitHub 更新程式時，只會重跑這個主程式，已載入的 pricing_core 會沿用舊版，
+# 導致找不到新函數。每次執行都重新載入，確保用的是最新版（只定義函數，成本很低）。
+pc = importlib.reload(pc)
 
 st.set_page_config(page_title="房價建議工具", page_icon="🏨", layout="wide")
 SAMPLE = Path(__file__).with_name("sample_data.xlsx")
