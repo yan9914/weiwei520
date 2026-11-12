@@ -1,0 +1,44 @@
+# 房價建議工具（Streamlit 原型）
+
+上傳歷史訂房資料，就會估計需求模型（依價格時段切分的設限卜瓦松迴歸），並產生建議價格：在**整個月平均成交價 ≥ 目標**的條件下，讓總營收最大的每日、每房型價格。
+
+## 檔案
+
+| 檔案 | 用途 |
+|---|---|
+| `streamlit_app.py` | 網頁介面（Streamlit 的主程式） |
+| `pricing_core.py` | 計算核心：讀檔檢查、估計模型、最佳化、輸出 Excel |
+| `make_sample.py` | 產生範例檔 `sample_data.xlsx`（模擬資料） |
+| `sample_data.xlsx` | 範例上傳檔，網頁上可以下載 |
+| `requirements.txt` | 雲端安裝套件用 |
+
+## 在自己電腦試跑
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+## 部署到 Streamlit Community Cloud
+
+1. 在 GitHub 建一個新的 repository，把 `pricing_app` 資料夾裡的檔案放在 repository 的根目錄。
+   - 只放程式和範例檔，**不要放真實的訂房資料**。`.gitignore` 已經擋掉 `.csv` 和 `.xlsx`，只保留 `sample_data.xlsx`。
+2. 到 https://share.streamlit.io ，用 GitHub 帳號登入。
+3. 按 **Create app**，選擇這個 repository 和分支，Main file path 填 `streamlit_app.py`，按 **Deploy**。
+4. 幾分鐘後就會得到一個網址。之後只要 push 到 GitHub，網站會自動更新。
+5. 如果只想給特定的人使用，可以在 App 的 **Settings → Sharing** 改成只有受邀的 email 才能開啟。免費方案的私人 App 數量有限制，詳細規則以官方說明為準。
+
+> 免費方案的資源有限（記憶體大約 1 GB）。長時間沒人使用時，App 會進入休眠，下次開啟要等一下才會喚醒。這個工具的計算量很小，不會碰到資源上限。
+
+## 隱私設計
+
+- 上傳的檔案只在記憶體中處理。程式不寫入任何檔案、資料庫或快取，刻意不使用 `st.cache_data`。
+- 估計結果只存在 `st.session_state`，每個瀏覽分頁各自獨立，關閉或重新整理網頁後就會清除。
+- 不同使用者之間看不到彼此的資料。
+- **仍要注意**：計算時，資料會暫時傳到 Streamlit（Snowflake）在美國的伺服器上處理。如果公司規定訂房資料不能離開台灣或公司內部，就要改用其他部署方式。
+- 上傳的資料只有房型、日期、價格、房數，**不含任何旅客個資**；主要的風險是商業機密。
+
+## 使用前要換掉的東西
+
+- **放假日**：範例檔裡的日期是模擬的，請換成人事行政總處公告的國定假日與補假日期。
+- **歷史時段資料**：每列是「某入住日、某房型、一段固定價格的期間」。賣光之後的時段不要列出來。詳細欄位說明在範例檔的「說明」工作表。

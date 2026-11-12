@@ -1,0 +1,105 @@
+# -*- coding: utf-8 -*-
+"""
+產生範例 Excel（sample_data.xlsx）：完全是模擬資料，用來示範上傳格式與試用網站。
+執行：python make_sample.py
+"""
+import datetime as dt
+
+import numpy as np
+import pandas as pd
+
+from pricing_core import Calendar, LMAX
+
+rng = np.random.default_rng(7)
+names = ["標準雙人", "高級雙人", "豪華雙人", "家庭四人", "景觀套房", "總統套房"]
+cap = np.array([20, 15, 12, 8, 5, 2])
+p_bar = np.array([4.0, 5.0, 6.5, 7.5, 9.0, 12.0])            # 千元
+
+
+def days(a, b):
+    a, b = dt.date.fromisoformat(a), dt.date.fromisoformat(b)
+    return [a + dt.timedelta(k) for k in range((b - a).days + 1)]
+
+
+# ⚠ 模擬用的放假日，不保證與實際公告一致
+HOLIDAYS = sorted(set(
+    days("2024-01-01", "2024-01-01") + days("2024-02-08", "2024-02-14") + days("2024-02-28", "2024-02-28")
+    + days("2024-04-04", "2024-04-07") + days("2024-06-10", "2024-06-10") + days("2024-09-17", "2024-09-17")
+    + days("2024-10-10", "2024-10-10")
+    + days("2025-01-01", "2025-01-01") + days("2025-01-25", "2025-02-02") + days("2025-02-28", "2025-02-28")
+    + days("2025-04-03", "2025-04-06") + days("2025-05-30", "2025-05-30") + days("2025-10-06", "2025-10-06")
+    + days("2025-10-10", "2025-10-10")
+    + days("2026-01-01", "2026-01-01") + days("2026-02-14", "2026-02-22") + days("2026-02-27", "2026-02-28")
+    + days("2026-04-03", "2026-04-06") + days("2026-06-19", "2026-06-19") + days("2026-09-25", "2026-09-25")
+    + days("2026-10-09", "2026-10-10")))
+cal = Calendar(HOLIDAYS)
+
+leads = np.arange(LMAX + 1)
+w = np.exp(-leads / 25) + 0.6 * np.exp(-leads / 3)
+true_h = np.log(w / w.sum())
+true_a = np.log(0.9 * cap)
+true_b1 = -1 / p_bar
+true_b2 = np.array([-0.02, -0.01, 0.0, -0.005, 0.003, 0.0])
+TRUE_MONTH = np.array([0.0, 0.1, -0.5, 0.0, -0.2, -0.1, 0.3, 0.35, -0.15, 0.05, -0.4, 0.1])
+TRUE_NIGHT = np.array([0.0, 0.4, 0.5, 0.55])
+
+
+def rate(i, p, d, L):
+    pc = p - p_bar[i]
+    z = TRUE_MONTH[d.month - 1] + TRUE_NIGHT[cal.night_type(d)]
+    return np.exp(true_a[i] + true_b1[i] * pc + true_b2[i] * pc**2 + true_h[L] + z)
+
+
+# 歷史時段：2024–2025，依訂房速度動態調價
+spell_def = [(90, 61), (60, 31), (30, 15), (14, 8), (7, 4), (3, 0)]
+rows = []
+for d in days("2024-01-01", "2025-12-31"):
+    for i in range(len(names)):
+        p = p_bar[i] * rng.uniform(0.75, 1.25)
+        booked = 0
+        for s, (Ls, Le) in enumerate(spell_def):
+            if s > 0:
+                target = 0.85 * cap[i] * w[Ls + 1:].sum() / w.sum()
+                ratio = booked / max(target, 0.5)
+                p *= rng.uniform(1.05, 1.15) if ratio > 1.15 else rng.uniform(0.88, 0.97) if ratio < 0.85 \
+                    else rng.uniform(0.97, 1.03)
+                p = np.clip(p, 0.6 * p_bar[i], 1.8 * p_bar[i])
+            p = round(p * 10) / 10
+            R = cap[i] - booked
+            if R == 0:
+                break
+            y = min(rng.poisson(rate(i, p, d, np.arange(Le, Ls + 1)).sum()), R)
+            rows.append((names[i], d, int(p * 1000), Ls, Le, y, R))
+            booked += y
+hist = pd.DataFrame(rows, columns=["房型", "入住日", "牌價", "開始提前天數", "結束提前天數", "訂房數", "時段開始剩餘房數"])
+
+# 目前訂房：假設今天是 2026-02-15，要定 2026 年 3 月的價格
+today = dt.date(2026, 2, 15)
+otb_rows = []
+for d in days("2026-03-01", "2026-03-31"):
+    L_now = (d - today).days
+    for i in range(len(names)):
+        p = round(p_bar[i] * rng.uniform(0.85, 1.1), 1)
+        n = min(rng.poisson(rate(i, p, d, np.arange(L_now + 1, LMAX + 1)).sum()), cap[i])
+        otb_rows.append((d, names[i], n, int(n * p * 1000)))
+otb = pd.DataFrame(otb_rows, columns=["入住日", "房型", "已售房數", "已售營收"])
+
+rooms = pd.DataFrame({"房型": names, "房量": cap, "最低價": np.nan, "最高價": np.nan})
+readme = pd.DataFrame({"說明": [
+    "這是模擬資料，只用來示範格式。",
+    "房型：房型名稱、房量；最低價、最高價可留空（留空 = 用歷史價格範圍）。",
+    "歷史時段：每列是某入住日、某房型、一段固定價格的期間。牌價以元為單位。",
+    "  開始提前天數 / 結束提前天數：這個價格從入住前幾天掛到入住前幾天（含），例如 30 和 15。",
+    "  訂房數：這段期間收到幾間訂房；時段開始剩餘房數：這段開始時還剩幾間可賣。",
+    "  賣光之後的時段不要列出來（不能當成需求是 0）。",
+    "放假日：國定假日與補假日期（週六日不用列）。⚠ 範例裡的日期是模擬的，請換成官方行事曆。",
+    "目前訂房：要定價的月份裡，每晚每個房型目前已售房數與已售營收（元）。",
+]})
+
+with pd.ExcelWriter("sample_data.xlsx", engine="openpyxl") as xw:
+    readme.to_excel(xw, sheet_name="說明", index=False)
+    rooms.to_excel(xw, sheet_name="房型", index=False)
+    hist.to_excel(xw, sheet_name="歷史時段", index=False)
+    pd.DataFrame({"日期": HOLIDAYS}).to_excel(xw, sheet_name="放假日", index=False)
+    otb.to_excel(xw, sheet_name="目前訂房", index=False)
+print(f"sample_data.xlsx：歷史時段 {len(hist):,} 列，目前訂房 {len(otb)} 列（今天 = {today}）")
