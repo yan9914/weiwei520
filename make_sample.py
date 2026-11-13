@@ -86,10 +86,10 @@ otb_rows = []
 for d in days("2026-03-01", "2026-03-31"):
     L_now = (d - today).days
     for i in range(len(names)):
-        p = round(p_bar[i] * rng.uniform(0.85, 1.1), 1)
+        p = round(p_bar[i] * rng.uniform(0.85, 1.35), 1)       # 開賣以來掛的牌價
         n = min(rng.poisson(rate(i, p, d, np.arange(L_now + 1, LMAX + 1)).sum()), cap[i])
-        otb_rows.append((d, names[i], n, int(n * p * 1000)))
-otb = pd.DataFrame(otb_rows, columns=["入住日", "房型", "已售房數", "已售營收"])
+        otb_rows.append((d, names[i], n, int(n * p * 1000), int(p * 1000)))
+otb = pd.DataFrame(otb_rows, columns=["入住日", "房型", "已售房數", "已售營收", "目前牌價"])
 
 rooms = pd.DataFrame({"房型": names, "房量": cap, "成本": [1200, 1400, 1700, 2000, 2300, 3500],
                       "最低價": np.nan, "最高價": np.nan})
@@ -103,7 +103,10 @@ readme = pd.DataFrame({"說明": [
     "  訂房數：這段期間收到幾間訂房；時段開始剩餘房數：這段開始時還剩幾間可賣。",
     "  賣光之後的時段不要列出來（不能當成需求是 0）。",
     "放假日：國定假日與補假日期（週六日不用列）。⚠ 範例裡的日期是模擬的，請換成官方行事曆。",
-    "目前訂房：要定價的月份裡，每晚每個房型目前已售房數與已售營收（元）。",
+    "目前訂房：要定價的期間裡，每晚每個房型的已售房數、已售營收（元）、目前牌價（元）。",
+    "  沒有賣出的格子也要列出來（已售房數 = 0），並填目前牌價：貝氏更新需要知道這些格子掛的價格。",
+    "  已售營收：實際成交金額，用來計算已成交的淨收益；沒有填時，會用「已售房數 × 目前牌價」估算。",
+    "  已售營收、目前牌價至少要有一欄，建議兩欄都填。",
 ]})
 
 with pd.ExcelWriter("sample_data.xlsx", engine="openpyxl") as xw:

@@ -75,7 +75,7 @@ SHEETS = {
     "房型": ["房型", "房量", "成本"],
     "歷史時段": ["房型", "入住日", "牌價", "開始提前天數", "結束提前天數", "訂房數", "時段開始剩餘房數"],
     "放假日": ["日期"],
-    "目前訂房": ["入住日", "房型", "已售房數", "已售營收"],
+    "目前訂房": ["入住日", "房型", "已售房數"],     # 另需「已售營收」或「目前牌價」至少一欄（建議兩欄都有）
 }
 
 
@@ -166,12 +166,30 @@ def read_workbook(file):
         otb = dfs["目前訂房"].copy()
         otb["房型"] = otb["房型"].astype(str).str.strip()
         otb["入住日"] = _to_date(otb["入住日"])
-        for c in ["已售房數", "已售營收"]:
-            otb[c] = pd.to_numeric(otb[c], errors="coerce")
+        has_rev, has_px = "已售營收" in otb.columns, "目前牌價" in otb.columns
+        if not (has_rev or has_px):
+            errors.append("「目前訂房」至少要有「已售營收」或「目前牌價」其中一欄")
+        for c in ["已售房數", "已售營收", "目前牌價"]:
+            otb[c] = pd.to_numeric(otb[c], errors="coerce") if c in otb.columns else np.nan
         _bad_rows(~otb["房型"].isin(names), "目前訂房", "房型不在「房型」工作表中", errors)
         _bad_rows(otb["入住日"].isna(), "目前訂房", "入住日不是有效日期", errors)
-        _bad_rows(otb[["已售房數", "已售營收"]].isna().any(axis=1) | (otb["已售房數"] < 0), "目前訂房",
-                  "已售房數、已售營收必須是 ≥ 0 的數字", errors)
+        _bad_rows(otb["已售房數"].isna() | (otb["已售房數"] < 0), "目前訂房", "已售房數必須是 ≥ 0 的數字", errors)
+        _bad_rows(otb["已售營收"] < 0, "目前訂房", "已售營收不能是負數", errors)
+        _bad_rows(otb["目前牌價"] <= 0, "目前訂房", "目前牌價必須大於 0", errors)
+        if not has_px:
+            warnings.append("「目前訂房」沒有「目前牌價」欄：貝氏更新時，還沒賣出的格子只能用歷史平均價近似，"
+                            "需求水準 u 可能偏低。")
+        if has_rev:
+            miss = otb["已售營收"].isna() & (otb["已售房數"] > 0)
+        else:
+            miss = otb["已售房數"] > 0
+        if miss.any():
+            fill = otb["已售房數"] * otb["目前牌價"]
+            _bad_rows(miss & fill.isna(), "目前訂房", "有已售房數，但已售營收和目前牌價都是空白", errors)
+            otb.loc[miss, "已售營收"] = fill[miss]
+            warnings.append(f"「目前訂房」有 {int(miss.sum())} 列沒有已售營收，暫以「已售房數 × 目前牌價」估算。"
+                            "如果這些訂房是用其他價格成交的，已成交的淨收益與平均淨收益目標的計算會有誤差。")
+        otb["已售營收"] = otb["已售營收"].fillna(0.0)
         _bad_rows(otb["已售房數"] > otb["房型"].map(capmap), "目前訂房", "已售房數超過房量", errors)
         if otb.duplicated(["入住日", "房型"]).any():
             errors.append("「目前訂房」同一個入住日、房型出現不只一列")
@@ -473,7 +491,8 @@ def update_level(model, holidays, otb, today, dates, alpha):
       先驗 u ~ Gamma(α, α)（平均 1）
       資料：dates 中每晚每房型，到今天為止已售 n，與歷史模型預期 E（代入已過去的提前天數）
       賣光的格子用 P(D ≥ 房量)（設限）；用 1 維網格算出後驗（沒有賣光時等於 Gamma(α+n, α+E)）
-    價格：用該格平均成交價；沒有成交的格子用歷史平均價 p̄（近似）。
+    價格（用來算 E）：有成交的格子用平均成交價（已售營收 ÷ 已售房數）；
+      沒有成交的格子用「目前牌價」；兩者都沒有才用歷史平均價 p̄（近似，會讓 u 偏低）。
     """
     if otb is None:
         return None
@@ -483,12 +502,14 @@ def update_level(model, holidays, otb, today, dates, alpha):
         return None
     K, names, cap = len(model.names), model.names, model.cap
     D = len(dates)
-    sold, rev = np.zeros((D, K)), np.zeros((D, K))
+    sold, rev, px = np.zeros((D, K)), np.zeros((D, K)), np.full((D, K), np.nan)
     di = {d: k for k, d in enumerate(dates)}
     ri = {n: i for i, n in enumerate(names)}
     for _, row in o.iterrows():
         sold[di[row["入住日"]], ri[row["房型"]]] = row["已售房數"]
         rev[di[row["入住日"]], ri[row["房型"]]] = row["已售營收"] / 1000
+        if "目前牌價" in row.index and pd.notna(row["目前牌價"]):
+            px[di[row["入住日"]], ri[row["房型"]]] = row["目前牌價"] / 1000
     months, ntypes = Calendar(holidays).features(dates)
     z = model.ctrl(months, ntypes)
     L_now = np.array([(d - today).days for d in dates])
@@ -496,7 +517,9 @@ def update_level(model, holidays, otb, today, dates, alpha):
     CUM = np.cumsum(np.exp(XH @ model.H.T).T, axis=1)                  # K × 91，CUM[i, L] = Σ_{l≤L}
     start_L = np.clip(L_now + 1, 0, LMAX + 1)
     elapsed = CUM[:, LMAX][None] - np.where(start_L[:, None] > 0, CUM[:, np.clip(start_L - 1, 0, LMAX)].T, 0.0)
-    price = np.where(sold > 0, rev / np.maximum(sold, 1), model.p_bar[None])
+    fallback = np.where(np.isnan(px), model.p_bar[None], px)
+    price = np.where(sold > 0, rev / np.maximum(sold, 1), fallback)
+    n_pbar = int(((sold == 0) & np.isnan(px)).sum())                    # 用歷史平均價近似的格子數
     pc = price - model.p_bar[None]
     E = np.exp(model.A[None] + model.B1[None] * pc + model.B2[None] * pc**2 + z[:, None]) * elapsed
     use = E > 1e-9
@@ -515,7 +538,7 @@ def update_level(model, holidays, otb, today, dates, alpha):
     cdf = np.cumsum(w)
     return dict(u=float((u * w).sum()), lo=float(u[np.searchsorted(cdf, 0.1)]), hi=float(u[np.searchsorted(cdf, 0.9)]),
                 n=float(n.sum()), E=float(Eu.sum()), cells=int(use.sum()), censored=int(cens.sum()), alpha=float(alpha),
-                weight=float(Eu.sum() / (Eu.sum() + alpha)))
+                weight=float(Eu.sum() / (Eu.sum() + alpha)), n_pbar=n_pbar)
 
 
 def price_range(model, holidays, start, end, today, otb, step, costs, bounds=None,
@@ -686,7 +709,8 @@ def price_range(model, holidays, start, end, today, otb, step, costs, bounds=Non
                         "先驗強度 α": round(level_info["alpha"], 1),
                         "目前訂房：實際已售": level_info["n"],
                         "目前訂房：歷史模型預期": round(level_info["E"], 1),
-                        "資料的權重": f"{level_info['weight']:.0%}"})
+                        "資料的權重": f"{level_info['weight']:.0%}",
+                        "用歷史平均價近似的格子數": level_info.get("n_pbar", 0)})
     summary.update({"定價區間": f"{start} ～ {end}（{len(P_dates)} 晚）"})
     summary.update({
                "定價區間：已成交房數": int(sold[in_P].sum()),
