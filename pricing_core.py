@@ -209,6 +209,8 @@ class Model:
     cens_rate: float
     hist_range: tuple
     notes: list = field(default_factory=list)
+    alpha_hist: float = 400.0                  # 從歷史資料估的貝氏先驗強度
+    level_hist: pd.DataFrame = None            # 歷史各年月的「實際 ÷ 模型」比例
 
     def ctrl(self, months, ntypes):
         miss = sorted({int(m) for m in months} - set(self.month_eff))
@@ -261,6 +263,19 @@ def _negll_grad(x, P, free, base):
     if not (np.isfinite(f) and np.all(np.isfinite(g))):
         return 1e15, np.zeros(free.sum())
     return f, -g[free]
+
+
+def _spell_mu(full, P):
+    """每個時段的預期需求 μ_j（和 _negll_grad 同一套公式）。"""
+    K = P["K"]
+    a, b1, b2 = full[0:K], full[K:2 * K], full[2 * K:3 * K]
+    h, gam = full[3 * K:6 * K].reshape(K, 3), full[6 * K:]
+    r = P["r"]
+    E = np.exp(np.clip(XH @ h.T, -30, 30)).T
+    CUM0 = np.concatenate([np.zeros((K, 1)), np.cumsum(E, 1)], 1)
+    HS = CUM0[r, P["Ls"] + 1] - CUM0[r, P["Le"]]
+    eta = np.clip(a[r] + b1[r] * P["pc"] + b2[r] * P["pc"]**2 + P["Z"] @ gam, -30, 30)
+    return np.exp(eta) * HS
 
 
 def _fit(P, quad, cap, start=None):
@@ -378,12 +393,27 @@ def fit_model(data, progress=None):
             notes.append(f"{names[i]} 估出來的價格係數不是負的（漲價需求反而增加），"
                          "通常代表旺季、假日等因素沒有控制好，這個房型的建議價格不可信。")
 
+    # 貝氏先驗強度 α：歷史上每個「年-月」的實際訂房 ÷ 模型預期，看它們離 1 多遠
+    #   比例的變異數 ≈ 真實的月度需求波動 + 卜瓦松隨機誤差（≈ 1/預期數），扣掉後者，α = 1 / 前者
+    mu = _spell_mu(params, P_use)
+    exp_obs = expected_min(mu, R, cap.max())                  # 考慮剩餘房數上限後的預期成交數
+    ym = np.array([d.year * 100 + d.month for d in udates])[di]
+    keys = sorted(set(ym))
+    obs = np.array([y[ym == k].sum() for k in keys])
+    exp_ = np.array([exp_obs[ym == k].sum() for k in keys])
+    ratios = obs / exp_
+    var_true = np.var(ratios, ddof=1) - np.mean(1 / exp_) if len(keys) > 2 else np.nan
+    alpha_hist = float(np.clip(1 / var_true, 5, 400)) if var_true == var_true and var_true > 0 else 400.0
+    level_hist = pd.DataFrame({"年月": [f"{k // 100}-{k % 100:02d}" for k in keys],
+                               "實際訂房 ÷ 模型預期": np.round(ratios, 3)})
+
     step(1.0, "完成")
     return Model(names=names, cap=cap, p_bar=p_bar, p_lo=p_lo, p_hi=p_hi,
                  A=params[0:K], B1=B1, B2=params[2 * K:3 * K], H=params[3 * K:6 * K].reshape(K, 3),
                  month_eff=month_eff, night_eff=night_eff, interact=interact, p_int=p_int,
                  quad=quad, pvals=pvals, checks=checks, n_spells=len(h),
-                 cens_rate=float(np.mean(y >= R)), hist_range=(min(udates), max(udates)), notes=notes)
+                 cens_rate=float(np.mean(y >= R)), hist_range=(min(udates), max(udates)), notes=notes,
+                 alpha_hist=alpha_hist, level_hist=level_hist)
 
 
 def model_tables(m):
@@ -437,8 +467,59 @@ def _date_range(a, b):
     return [a + k * ONE for k in range((b - a).days + 1)]
 
 
+def update_level(model, holidays, otb, today, dates, alpha):
+    """
+    貝氏更新「需求水準 u」：實際需求 = u × 歷史模型需求
+      先驗 u ~ Gamma(α, α)（平均 1）
+      資料：dates 中每晚每房型，到今天為止已售 n，與歷史模型預期 E（代入已過去的提前天數）
+      賣光的格子用 P(D ≥ 房量)（設限）；用 1 維網格算出後驗（沒有賣光時等於 Gamma(α+n, α+E)）
+    價格：用該格平均成交價；沒有成交的格子用歷史平均價 p̄（近似）。
+    """
+    if otb is None:
+        return None
+    dates = list(dates)
+    o = otb[otb["入住日"].isin(dates)]
+    if len(o) == 0:
+        return None
+    K, names, cap = len(model.names), model.names, model.cap
+    D = len(dates)
+    sold, rev = np.zeros((D, K)), np.zeros((D, K))
+    di = {d: k for k, d in enumerate(dates)}
+    ri = {n: i for i, n in enumerate(names)}
+    for _, row in o.iterrows():
+        sold[di[row["入住日"]], ri[row["房型"]]] = row["已售房數"]
+        rev[di[row["入住日"]], ri[row["房型"]]] = row["已售營收"] / 1000
+    months, ntypes = Calendar(holidays).features(dates)
+    z = model.ctrl(months, ntypes)
+    L_now = np.array([(d - today).days for d in dates])
+    # 已經過去的提前天數：L_now+1 … 90（入住日已過則為 0 … 90）
+    CUM = np.cumsum(np.exp(XH @ model.H.T).T, axis=1)                  # K × 91，CUM[i, L] = Σ_{l≤L}
+    start_L = np.clip(L_now + 1, 0, LMAX + 1)
+    elapsed = CUM[:, LMAX][None] - np.where(start_L[:, None] > 0, CUM[:, np.clip(start_L - 1, 0, LMAX)].T, 0.0)
+    price = np.where(sold > 0, rev / np.maximum(sold, 1), model.p_bar[None])
+    pc = price - model.p_bar[None]
+    E = np.exp(model.A[None] + model.B1[None] * pc + model.B2[None] * pc**2 + z[:, None]) * elapsed
+    use = E > 1e-9
+    if not use.any():
+        return None
+    n, Eu, capu = sold[use], E[use], np.broadcast_to(cap[None], sold.shape)[use]
+    cens = n >= capu
+
+    u = np.linspace(0.02, 5, 2500)
+    logp = (alpha - 1) * np.log(u) - alpha * u
+    logp += (n[~cens].sum() * np.log(u)) - u * Eu[~cens].sum()
+    if cens.any():
+        logp += stats.poisson.logsf(n[cens][None] - 1, u[:, None] * Eu[cens][None]).sum(1)
+    w = np.exp(logp - logp.max())
+    w /= w.sum()
+    cdf = np.cumsum(w)
+    return dict(u=float((u * w).sum()), lo=float(u[np.searchsorted(cdf, 0.1)]), hi=float(u[np.searchsorted(cdf, 0.9)]),
+                n=float(n.sum()), E=float(Eu.sum()), cells=int(use.sum()), censored=int(cens.sum()), alpha=float(alpha),
+                weight=float(Eu.sum() / (Eu.sum() + alpha)))
+
+
 def price_range(model, holidays, start, end, today, otb, step, costs, bounds=None,
-                target=None, buffer=0, window=None):
+                target=None, buffer=0, window=None, level=1.0, level_info=None):
     """
     start, end : 定價日期區間（含頭尾）
     costs      : {房型: 每間夜成本（元）}
@@ -516,8 +597,8 @@ def price_range(model, holidays, start, end, today, otb, step, costs, bounds=Non
     S_list = []
     for i in range(K):
         pc = grids[i] - model.p_bar[i]
-        level = np.exp(model.A[i] + model.B1[i] * pc + model.B2[i] * pc**2)
-        lam = level[None] * (np.exp(z) * CUM[i, Lc])[:, None]
+        lev = np.exp(model.A[i] + model.B1[i] * pc + model.B2[i] * pc**2)
+        lam = level * lev[None] * (np.exp(z) * CUM[i, Lc])[:, None]
         Si = expected_min(lam, remaining[:, i][:, None], cap[i])
         Si[~open_[:, i]] = 0.0
         S_list.append(Si)
@@ -598,13 +679,22 @@ def price_range(model, holidays, start, end, today, otb, step, costs, bounds=Non
         return dict(rooms=rooms_, rev=money, net=net, adr=per(money), net_avg=per(net))
 
     tp, tf = totals(in_P, P, Sx), totals(in_P, P0, S0)
-    summary = {"定價區間": f"{start} ～ {end}（{len(P_dates)} 晚）",
+    summary = {"需求預測方式": "貝氏更新" if level_info else "只用歷史模型"}
+    if level_info:
+        summary.update({"需求水準 u（後驗平均）": round(level_info["u"], 3),
+                        "u 的 80% 區間": f"{level_info['lo']:.2f} ～ {level_info['hi']:.2f}",
+                        "先驗強度 α": round(level_info["alpha"], 1),
+                        "目前訂房：實際已售": level_info["n"],
+                        "目前訂房：歷史模型預期": round(level_info["E"], 1),
+                        "資料的權重": f"{level_info['weight']:.0%}"})
+    summary.update({"定價區間": f"{start} ～ {end}（{len(P_dates)} 晚）"})
+    summary.update({
                "定價區間：已成交房數": int(sold[in_P].sum()),
                "定價區間：預期總房數": tp["rooms"],
                "定價區間：預期總淨收益": tp["net"],
                "定價區間：預期總營收": tp["rev"],
                "定價區間：預期平均淨收益（每間夜）": tp["net_avg"],
-               "定價區間：預期平均成交價": tp["adr"]}
+               "定價區間：預期平均成交價": tp["adr"]})
     if use_target:
         tw, twf = totals(in_W, P, Sx), totals(in_W, P0, S0)
         ws = sold[in_W].sum()

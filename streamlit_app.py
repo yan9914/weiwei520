@@ -59,6 +59,17 @@ with st.sidebar:
     step = st.selectbox("價格級距（元）", [1, 10, 50, 100, 200, 500], index=3,
                         help="建議價格會是這個數字的倍數。級距越小計算越久，但營收幾乎不會增加。")
 
+    method = st.radio("需求預測方式", ["只用歷史模型", "貝氏更新"], index=0,
+                      help="貝氏更新：把歷史模型當先驗，用「目前訂房」比歷史模型預期多或少，"
+                           "調整這段期間的整體需求水準 u。")
+    use_bayes = method == "貝氏更新"
+    alpha_user = None
+    if use_bayes:
+        if not st.checkbox("先驗強度 α 用歷史資料自動估計", value=True,
+                           help="α 越大，越相信歷史模型；越小，越相信目前訂房。"):
+            alpha_user = st.number_input("先驗強度 α", min_value=1.0, value=100.0, step=10.0,
+                                         help="大約等於「歷史模型值得多少間訂房的證據」。")
+
     use_target = st.checkbox("設定平均淨收益目標", value=True,
                              help="平均淨收益 = 總淨收益 ÷ 總房數（每間夜）。不勾選：只做總淨收益最大化。")
     target = buffer = window = None
@@ -130,6 +141,11 @@ with st.expander("需求模型估計結果", expanded=False):
     a.dataframe(night_t, hide_index=True, use_container_width=True)
     b.subheader("月份")
     b.dataframe(month_t, hide_index=True, use_container_width=True)
+    st.subheader("貝氏先驗：歷史各月的需求水準")
+    st.markdown(f"歷史上每個月「實際訂房 ÷ 模型預期」偏離 1 的程度，換算成先驗強度 **α ≈ {m.alpha_hist:.0f}**"
+                "（扣除隨機誤差後；α 越大代表歷史上各月越接近模型）。")
+    if m.level_hist is not None:
+        st.dataframe(m.level_hist, hide_index=True, use_container_width=True)
 for n in m.notes:
     st.warning(n)
 
@@ -158,10 +174,22 @@ st.markdown(desc, unsafe_allow_html=True)
 
 if st.button("產生建議價格", type="primary"):
     try:
+        level, level_info = 1.0, None
+        if use_bayes:
+            upd_dates = set(pc._date_range(*price_rng))
+            if use_target and window is not None:
+                upd_dates |= set(pc._date_range(*window))
+            alpha = alpha_user if alpha_user is not None else m.alpha_hist
+            level_info = pc.update_level(m, data["holidays"], data["otb"], today, sorted(upd_dates), alpha)
+            if level_info is None:
+                st.warning("「目前訂房」裡沒有這段期間已經開始銷售的資料，無法做貝氏更新，改用歷史模型。")
+            else:
+                level = level_info["u"]
         with st.spinner("計算中…"):
             ss.result = pc.price_range(m, data["holidays"], price_rng[0], price_rng[1], today, data["otb"],
                                        step, costs, bounds, target=target if use_target else None,
-                                       buffer=buffer or 0, window=window)
+                                       buffer=buffer or 0, window=window,
+                                       level=level, level_info=level_info)
     except pc.InputError as e:
         st.error(str(e))
         ss.pop("result", None)
@@ -184,6 +212,13 @@ if "result" in ss:
         th = s["θ（每間房的虛擬成本）"]
         k4.metric("θ（虛擬成本）", f"{fmt(th)} 元", "目標吃緊" if th > 0 else "目標沒有發揮作用",
                   delta_color="off")
+    if "需求水準 u（後驗平均）" in s:
+        u = s["需求水準 u（後驗平均）"]
+        st.info(f"**貝氏更新：需求水準 u = {u:.2f}**（80% 區間 {s['u 的 80% 區間']}）。"
+                f"目前訂房實際已售 {s['目前訂房：實際已售']:,.0f} 間，歷史模型預期 {s['目前訂房：歷史模型預期']:,.0f} 間；"
+                f"先驗強度 α = {s['先驗強度 α']:.0f}，資料的權重 {s['資料的權重']}。"
+                f"未來需求的預測已乘上 {u:.2f}（{'比' if u >= 1 else '比'}歷史模型{'高' if u >= 1 else '低'} {abs(u - 1):.0%}）。",
+                icon="📈")
     for w in res["warnings"]:
         st.warning(w)
 

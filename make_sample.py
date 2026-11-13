@@ -44,10 +44,17 @@ TRUE_MONTH = np.array([0.0, 0.1, -0.5, 0.0, -0.2, -0.1, 0.3, 0.35, -0.15, 0.05, 
 TRUE_NIGHT = np.array([0.0, 0.4, 0.5, 0.55])
 
 
+# 每個「年-月」的市場需求衝擊（歷史模型看不到）：歷史月份隨機 ±15% 左右；
+# 2026 年 3 月設定為比平常熱 25%，用來示範貝氏更新能從目前訂房偵測到這個變化
+SHOCK = {(y, m): float(np.exp(rng.normal(0, 0.15))) for y in (2024, 2025) for m in range(1, 13)}
+SHOCK[(2026, 3)] = 1.25
+
+
 def rate(i, p, d, L):
     pc = p - p_bar[i]
     z = TRUE_MONTH[d.month - 1] + TRUE_NIGHT[cal.night_type(d)]
-    return np.exp(true_a[i] + true_b1[i] * pc + true_b2[i] * pc**2 + true_h[L] + z)
+    return SHOCK.get((d.year, d.month), 1.0) * np.exp(true_a[i] + true_b1[i] * pc + true_b2[i] * pc**2
+                                                       + true_h[L] + z)
 
 
 # 歷史時段：2024–2025，依訂房速度動態調價
