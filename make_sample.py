@@ -80,16 +80,40 @@ for d in days("2024-01-01", "2025-12-31"):
             booked += y
 hist = pd.DataFrame(rows, columns=["房型", "入住日", "牌價", "開始提前天數", "結束提前天數", "訂房數", "時段開始剩餘房數"])
 
-# 目前訂房：假設今天是 2026-02-15，要定 2026 年 3 月的價格
+# 目前時段：假設今天是 2026-02-15，要定 2026 年 3 月的價格。
+# 從開賣到今天，同樣依訂房速度動態調價；最後一段的結束提前天數 = 今天距入住日的天數
 today = dt.date(2026, 2, 15)
-otb_rows = []
+cur_rows = []
 for d in days("2026-03-01", "2026-03-31"):
     L_now = (d - today).days
     for i in range(len(names)):
-        p = round(p_bar[i] * rng.uniform(0.85, 1.35), 1)       # 開賣以來掛的牌價
-        n = min(rng.poisson(rate(i, p, d, np.arange(L_now + 1, LMAX + 1)).sum()), cap[i])
-        otb_rows.append((d, names[i], n, int(n * p * 1000), int(p * 1000)))
-otb = pd.DataFrame(otb_rows, columns=["入住日", "房型", "已售房數", "已售營收", "目前牌價"])
+        p = p_bar[i] * rng.uniform(0.85, 1.35)
+        booked = 0
+        for s_, (Ls, Le) in enumerate(spell_def):
+            if Ls < L_now:                                     # 這段還沒開始
+                break
+            if s_ > 0:
+                target = 0.85 * cap[i] * w[Ls + 1:].sum() / w.sum()
+                ratio = booked / max(target, 0.5)
+                p *= rng.uniform(1.05, 1.15) if ratio > 1.15 else rng.uniform(0.80, 0.92) if ratio < 0.85 \
+                    else rng.uniform(0.97, 1.03)
+                p = np.clip(p, 0.6 * p_bar[i], 1.8 * p_bar[i])
+            p = round(p * 10) / 10
+            R = cap[i] - booked
+            if R == 0:
+                break
+            Le_ = max(Le, L_now)
+            y = min(rng.poisson(rate(i, p, d, np.arange(Le_, Ls + 1)).sum()), R)
+            cur_rows.append((names[i], d, int(p * 1000), Ls, Le_, y, R))
+            booked += y
+cur = pd.DataFrame(cur_rows, columns=["房型", "入住日", "牌價", "開始提前天數", "結束提前天數", "訂房數", "時段開始剩餘房數"])
+
+# 目前訂房：由目前時段彙總（實務上已售營收建議用訂房系統的實際金額）
+cur["營收"] = cur["訂房數"] * cur["牌價"]
+g = cur.groupby(["入住日", "房型"], sort=False)
+otb = g.agg(已售房數=("訂房數", "sum"), 已售營收=("營收", "sum")).reset_index()
+otb["目前牌價"] = g["牌價"].last().to_numpy()
+cur = cur.drop(columns="營收")
 
 rooms = pd.DataFrame({"房型": names, "房量": cap, "成本": [1200, 1400, 1700, 2000, 2300, 3500],
                       "最低價": np.nan, "最高價": np.nan})
@@ -103,7 +127,11 @@ readme = pd.DataFrame({"說明": [
     "  訂房數：這段期間收到幾間訂房；時段開始剩餘房數：這段開始時還剩幾間可賣。",
     "  賣光之後的時段不要列出來（不能當成需求是 0）。",
     "放假日：國定假日與補假日期（週六日不用列）。⚠ 範例裡的日期是模擬的，請換成官方行事曆。",
-    "目前訂房：要定價的期間裡，每晚每個房型的已售房數、已售營收（元）、目前牌價（元）。",
+    "目前時段（建議提供）：格式和「歷史時段」完全相同，換成要定價的入住日，記錄從開賣到今天的每一段牌價與訂房數。",
+    "  最後一段的結束提前天數 = 今天距入住日的天數。沒有賣出的入住日也要列出它的時段（訂房數 = 0）。",
+    "  有這張表時，貝氏更新會逐段精確計算；也可以由它推算已售房數、已售營收（訂房數 × 牌價）、目前牌價。",
+    "目前訂房（選填）：要定價的期間裡，每晚每個房型的已售房數、已售營收（元）、目前牌價（元）。",
+    "  有提供時，已售房數與已售營收以這張表為準（例如有折扣、不同通路價、取消時，請用實際金額）。",
     "  沒有賣出的格子也要列出來（已售房數 = 0），並填目前牌價：貝氏更新需要知道這些格子掛的價格。",
     "  已售營收：實際成交金額，用來計算已成交的淨收益；沒有填時，會用「已售房數 × 目前牌價」估算。",
     "  已售營收、目前牌價至少要有一欄，建議兩欄都填。",
@@ -114,5 +142,6 @@ with pd.ExcelWriter("sample_data.xlsx", engine="openpyxl") as xw:
     rooms.to_excel(xw, sheet_name="房型", index=False)
     hist.to_excel(xw, sheet_name="歷史時段", index=False)
     pd.DataFrame({"日期": HOLIDAYS}).to_excel(xw, sheet_name="放假日", index=False)
+    cur.to_excel(xw, sheet_name="目前時段", index=False)
     otb.to_excel(xw, sheet_name="目前訂房", index=False)
-print(f"sample_data.xlsx：歷史時段 {len(hist):,} 列，目前訂房 {len(otb)} 列（今天 = {today}）")
+print(f"sample_data.xlsx：歷史時段 {len(hist):,} 列，目前時段 {len(cur)} 列，目前訂房 {len(otb)} 列（今天 = {today}）")

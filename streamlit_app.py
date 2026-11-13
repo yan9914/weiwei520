@@ -46,8 +46,10 @@ with st.sidebar:
             "- **房型**：房型、房量、成本（每間夜，元；可加最低價、最高價）\n"
             "- **歷史時段**：房型、入住日、牌價、開始提前天數、結束提前天數、訂房數、時段開始剩餘房數\n"
             "- **放假日**：日期（國定假日與補假，週六日不用列）\n"
-            "- **目前訂房**：入住日、房型、已售房數、已售營收、目前牌價"
-            "（營收與牌價至少一欄，建議都填；沒賣出的格子也要列出並填牌價）\n\n"
+            "- **目前時段**（建議）：格式同歷史時段，記錄要定價的入住日從開賣到今天的每段牌價與訂房數；"
+            "貝氏更新會逐段精確計算，也能推算已售房數、已售營收與目前牌價\n"
+            "- **目前訂房**（選填）：入住日、房型、已售房數、已售營收、目前牌價"
+            "（有提供時，已售房數與營收以這張表為準）\n\n"
             "詳細說明在範例檔的「說明」工作表。")
 
     st.header("③ 定價參數")
@@ -181,9 +183,10 @@ if st.button("產生建議價格", type="primary"):
             if use_target and window is not None:
                 upd_dates |= set(pc._date_range(*window))
             alpha = alpha_user if alpha_user is not None else m.alpha_hist
-            level_info = pc.update_level(m, data["holidays"], data["otb"], today, sorted(upd_dates), alpha)
+            level_info = pc.update_level(m, data["holidays"], data["otb"], today, sorted(upd_dates), alpha,
+                                         spells=data.get("cur"))
             if level_info is None:
-                st.warning("「目前訂房」裡沒有這段期間已經開始銷售的資料，無法做貝氏更新，改用歷史模型。")
+                st.warning("「目前時段」與「目前訂房」裡都沒有這段期間已經開始銷售的資料，無法做貝氏更新，改用歷史模型。")
             else:
                 level = level_info["u"]
         with st.spinner("計算中…"):
@@ -216,7 +219,8 @@ if "result" in ss:
     if "需求水準 u（後驗平均）" in s:
         u = s["需求水準 u（後驗平均）"]
         st.info(f"**貝氏更新：需求水準 u = {u:.2f}**（80% 區間 {s['u 的 80% 區間']}）。"
-                f"目前訂房實際已售 {s['目前訂房：實際已售']:,.0f} 間，歷史模型預期 {s['目前訂房：歷史模型預期']:,.0f} 間；"
+                f"資料來源：{s.get('貝氏更新的資料來源', '')}。"
+                f"到今天實際已售 {s['目前訂房：實際已售']:,.0f} 間，歷史模型預期 {s['目前訂房：歷史模型預期']:,.0f} 間；"
                 f"先驗強度 α = {s['先驗強度 α']:.0f}，資料的權重 {s['資料的權重']}。"
                 f"未來需求的預測已乘上 {u:.2f}（比歷史模型{'高' if u >= 1 else '低'} {abs(u - 1):.0%}）。",
                 icon="📈")
