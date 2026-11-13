@@ -31,7 +31,7 @@ def as_range(v):
 
 
 st.title("🏨 房價建議工具")
-st.caption("產生每日、每房型的建議價格，讓總營收最大；也可以加上「平均成交價不低於目標」的條件。")
+st.caption("產生每日、每房型的建議價格，讓總淨收益（成交價 − 房型成本）最大；也可以加上「平均淨收益不低於目標」的條件。")
 st.info("🔒 上傳的資料只在這次瀏覽中暫存在記憶體，不會寫入硬碟或資料庫；"
         "關閉或重新整理網頁後就會清除，下次使用需要重新上傳。", icon="🔒")
 
@@ -43,7 +43,7 @@ with st.sidebar:
                            help="包含格式說明與兩年的模擬資料，可以直接上傳試用。")
     with st.expander("Excel 需要哪些工作表？"):
         st.markdown(
-            "- **房型**：房型、房量（可加最低價、最高價）\n"
+            "- **房型**：房型、房量、成本（每間夜，元；可加最低價、最高價）\n"
             "- **歷史時段**：房型、入住日、牌價、開始提前天數、結束提前天數、訂房數、時段開始剩餘房數\n"
             "- **放假日**：日期（國定假日與補假，週六日不用列）\n"
             "- **目前訂房**：入住日、房型、已售房數、已售營收\n\n"
@@ -59,17 +59,17 @@ with st.sidebar:
     step = st.selectbox("價格級距（元）", [1, 10, 50, 100, 200, 500], index=3,
                         help="建議價格會是這個數字的倍數。級距越小計算越久，但營收幾乎不會增加。")
 
-    use_target = st.checkbox("設定平均成交價目標", value=True,
-                             help="不勾選：只做營收最大化，不限制平均成交價。")
+    use_target = st.checkbox("設定平均淨收益目標", value=True,
+                             help="平均淨收益 = 總淨收益 ÷ 總房數（每間夜）。不勾選：只做總淨收益最大化。")
     target = buffer = window = None
     if use_target:
-        target = st.number_input("平均成交價目標（元）", min_value=0, value=6000, step=100)
+        target = st.number_input("平均淨收益目標（元／間夜）", min_value=0, value=5000, step=100)
         buffer = st.number_input("安全緩衝（元）", min_value=0, value=100, step=50,
                                  help="計算時用「目標 + 緩衝」，降低實際結果略低於目標的機會。")
-        same = st.checkbox("平均價計算區間 = 定價區間", value=True)
+        same = st.checkbox("平均淨收益計算區間 = 定價區間", value=True)
         if not same:
-            window = as_range(st.date_input("平均價計算區間", value=(nm, nm_end), key="window",
-                                            help="這段期間所有晚上（含已過去的）合計的平均成交價要達標。"))
+            window = as_range(st.date_input("平均淨收益計算區間", value=(nm, nm_end), key="window",
+                                            help="這段期間所有晚上（含已過去的）合計的平均淨收益要達標。"))
 
 # ---------------- ② 上傳與估計 ----------------
 st.header("② 上傳資料並估計需求模型")
@@ -139,27 +139,28 @@ if price_rng is None:
     st.info("請在左側選好定價日期區間的開始日與結束日。")
     st.stop()
 if use_target and not same and window is None:
-    st.info("請在左側選好平均價計算區間的開始日與結束日。")
+    st.info("請在左側選好平均淨收益計算區間的開始日與結束日。")
     st.stop()
 
 rooms = data["rooms"]
+costs = dict(zip(rooms["房型"], rooms["成本"]))
 bounds = {}
 if {"最低價", "最高價"} <= set(rooms.columns):
     bounds = {r["房型"]: (r["最低價"], r["最高價"]) for _, r in rooms.iterrows()}
 desc = f"定價區間：**{price_rng[0]} ～ {price_rng[1]}**，計算日期：**{today}**，價格級距：**{step} 元**"
 if use_target:
     w_txt = "與定價區間相同" if window is None else f"{window[0]} ～ {window[1]}"
-    desc += (f"<br>平均價目標：**{target:,} 元** + 緩衝 {buffer:,} 元 = 計算用 **{target + buffer:,} 元**，"
+    desc += (f"<br>平均淨收益目標：**{target:,} 元／間夜** + 緩衝 {buffer:,} 元 = 計算用 **{target + buffer:,} 元**，"
              f"計算區間：**{w_txt}**")
 else:
-    desc += "<br>不設平均價目標：只做營收最大化"
+    desc += "<br>不設平均淨收益目標：只做總淨收益最大化"
 st.markdown(desc, unsafe_allow_html=True)
 
 if st.button("產生建議價格", type="primary"):
     try:
         with st.spinner("計算中…"):
             ss.result = pc.price_range(m, data["holidays"], price_rng[0], price_rng[1], today, data["otb"],
-                                       step, bounds, target=target if use_target else None,
+                                       step, costs, bounds, target=target if use_target else None,
                                        buffer=buffer or 0, window=window)
     except pc.InputError as e:
         st.error(str(e))
@@ -170,15 +171,16 @@ if "result" in ss:
     s = res["summary"]
     fmt = lambda v: "—" if v is None else f"{v:,.0f}"
     k1, k2 = st.columns(2)
-    k1.metric("定價區間：預期總營收", f"{fmt(s['定價區間：預期總營收'])} 元",
-              (f"{s['定價區間：預期總營收'] - s['不設限時：定價區間預期營收']:+,.0f} 元（相對不設限）"
-               if res["use_target"] else None), delta_color="off")
-    k2.metric("定價區間：預期平均價", f"{fmt(s['定價區間：預期平均價'])} 元",
-              f"已成交 {s['定價區間：已成交房數']:,} 間", delta_color="off")
+    k1.metric("定價區間：預期總淨收益", f"{fmt(s['定價區間：預期總淨收益'])} 元",
+              (f"{s['定價區間：預期總淨收益'] - s['不設限時：定價區間預期總淨收益']:+,.0f} 元（相對不設限）"
+               if res["use_target"] else f"營收 {fmt(s['定價區間：預期總營收'])} 元"), delta_color="off")
+    k2.metric("定價區間：預期平均淨收益", f"{fmt(s['定價區間：預期平均淨收益（每間夜）'])} 元",
+              f"平均成交價 {fmt(s['定價區間：預期平均成交價'])} 元，已成交 {s['定價區間：已成交房數']:,} 間",
+              delta_color="off")
     if res["use_target"]:
         k3, k4 = st.columns(2)
-        k3.metric("計算區間：預期平均價", f"{fmt(s['計算區間：預期平均價'])} 元",
-                  f"不設限時 {fmt(s['不設限時：計算區間預期平均價'])} 元", delta_color="off")
+        k3.metric("計算區間：預期平均淨收益", f"{fmt(s['計算區間：預期平均淨收益'])} 元",
+                  f"不設限時 {fmt(s['不設限時：計算區間預期平均淨收益'])} 元", delta_color="off")
         th = s["θ（每間房的虛擬成本）"]
         k4.metric("θ（虛擬成本）", f"{fmt(th)} 元", "目標吃緊" if th > 0 else "目標沒有發揮作用",
                   delta_color="off")
