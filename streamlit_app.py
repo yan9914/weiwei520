@@ -223,7 +223,11 @@ if "result" in ss:
         st.warning(w)
 
     st.subheader("建議價格（元）")
-    st.dataframe(res["price_table"], hide_index=True, use_container_width=True, height=600)
+    # 價格欄混有數字與「售完」「已過」，顯示時統一轉成文字（千分位），避免表格轉換錯誤
+    shown = res["price_table"].copy()
+    for n in m.names:
+        shown[n] = [f"{v:,}" if isinstance(v, int) else v for v in shown[n]]
+    st.dataframe(shown, hide_index=True, use_container_width=True, height=600)
     with st.expander("預測明細"):
         st.dataframe(res["detail"], hide_index=True, use_container_width=True)
 
