@@ -45,7 +45,8 @@ with st.sidebar:
         st.markdown(
             "- **房型**：房型、房量、成本（每間夜，元；可加最低價、最高價）\n"
             "- **歷史時段**：房型、入住日、牌價、開始提前天數、結束提前天數、訂房數、時段開始剩餘房數\n"
-            "- **放假日**：日期（國定假日與補假，週六日不用列）\n"
+            "- **放假日**：日期（國定假日與補假，一般週六日不用列）；選填「節日」（例如 除夕、初一～初三）"
+            "與「放假」（是／否，不放假的特殊日子填否）\n"
             "- **目前時段**（建議）：格式同歷史時段，記錄要定價的入住日從開賣到今天的每段牌價與訂房數；"
             "貝氏更新會逐段精確計算，也能推算已售房數、已售營收與目前牌價\n"
             "- **目前訂房**（選填）：入住日、房型、已售房數、已售營收、目前牌價"
@@ -112,6 +113,9 @@ c1, c2, c3 = st.columns(3)
 c1.metric("房型數", len(data["rooms"]))
 c2.metric("歷史價格時段", f"{len(h):,}")
 c3.metric("放假日", len(data["holidays"]))
+if data.get("special"):
+    labs = sorted(set(data["special"].values()))
+    st.caption(f"節日名稱（請確認拼法一致）：{'、'.join(labs)}")
 st.caption(f"歷史入住日範圍：{h['入住日'].min()} ～ {h['入住日'].max()}")
 for w in ss.read_warns:
     st.warning(w)
@@ -144,6 +148,11 @@ with st.expander("需求模型估計結果", expanded=False):
     a.dataframe(night_t, hide_index=True, use_container_width=True)
     b.subheader("月份")
     b.dataframe(month_t, hide_index=True, use_container_width=True)
+    sp_t = pc.special_table(m)
+    if sp_t is not None:
+        st.subheader("節日")
+        st.markdown("在月份與夜晚類型之上，再乘的倍數。不同年份同名的節日共用一個效果。")
+        st.dataframe(sp_t, hide_index=True, use_container_width=True)
     st.subheader("貝氏先驗：歷史各月的需求水準")
     st.markdown(f"歷史上每個月「實際訂房 ÷ 模型預期」偏離 1 的程度，換算成先驗強度 **α ≈ {m.alpha_hist:.0f}**"
                 "（扣除隨機誤差後；α 越大代表歷史上各月越接近模型）。")
@@ -177,20 +186,21 @@ st.markdown(desc, unsafe_allow_html=True)
 
 if st.button("產生建議價格", type="primary"):
     try:
+        cal = pc.Calendar(data["holidays"], data.get("special"))
         level, level_info = 1.0, None
         if use_bayes:
             upd_dates = set(pc._date_range(*price_rng))
             if use_target and window is not None:
                 upd_dates |= set(pc._date_range(*window))
             alpha = alpha_user if alpha_user is not None else m.alpha_hist
-            level_info = pc.update_level(m, data["holidays"], data["otb"], today, sorted(upd_dates), alpha,
+            level_info = pc.update_level(m, cal, data["otb"], today, sorted(upd_dates), alpha,
                                          spells=data.get("cur"))
             if level_info is None:
                 st.warning("「目前時段」與「目前訂房」裡都沒有這段期間已經開始銷售的資料，無法做貝氏更新，改用歷史模型。")
             else:
                 level = level_info["u"]
         with st.spinner("計算中…"):
-            ss.result = pc.price_range(m, data["holidays"], price_rng[0], price_rng[1], today, data["otb"],
+            ss.result = pc.price_range(m, cal, price_rng[0], price_rng[1], today, data["otb"],
                                        step, costs, bounds, target=target if use_target else None,
                                        buffer=buffer or 0, window=window,
                                        level=level, level_info=level_info)

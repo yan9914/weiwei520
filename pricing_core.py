@@ -41,8 +41,9 @@ XH = h_basis(LEADS)                                    # 91 × 3
 # 行事曆：夜晚類型 = 週末(週五/六晚) × 假日夜(隔天放假，且該段連假含國定假日)
 # ---------------------------------------------------------------
 class Calendar:
-    def __init__(self, holidays):
-        self.holidays = set(holidays)
+    def __init__(self, holidays, special=None):
+        self.holidays = set(holidays)            # 放假日（影響夜晚類型）
+        self.special = dict(special or {})       # {日期: 節日名稱}（另外估一個效果）
         self._cache = {}
 
     def is_off(self, d):
@@ -66,6 +67,14 @@ class Calendar:
 
     def features(self, dates):
         return np.array([d.month for d in dates]), np.array([self.night_type(d) for d in dates])
+
+    def labels(self, dates):
+        return np.array([self.special.get(d, "") for d in dates], dtype=object)
+
+
+def _as_cal(holidays):
+    """price_range / update_level 可以傳 Calendar（含節日），或只傳放假日清單。"""
+    return holidays if isinstance(holidays, Calendar) else Calendar(holidays)
 
 
 # ---------------------------------------------------------------
@@ -181,12 +190,23 @@ def read_workbook(file):
         else:
             cur = _parse_spells(cdf.dropna(how="all"), "目前時段", names, capmap, errors, warnings)
 
-    # 放假日
-    holidays = []
+    # 放假日（選填欄位：節日 = 節日名稱，放假 = 是／否，空白 = 是）
+    holidays, special = [], {}
     if "放假日" in dfs:
-        hd = _to_date(dfs["放假日"]["日期"])
+        hdf = dfs["放假日"]
+        hd = _to_date(hdf["日期"])
         _bad_rows(hd.isna(), "放假日", "不是有效日期", errors)
-        holidays = [d for d in hd if pd.notna(d)]
+        off = pd.Series(True, index=hdf.index)
+        if "放假" in hdf.columns:
+            flag = hdf["放假"].where(hdf["放假"].notna(), "").astype(str).str.strip()
+            yes = {"", "是", "Y", "y", "True", "TRUE", "1", "1.0"}
+            no = {"否", "N", "n", "False", "FALSE", "0", "0.0"}
+            _bad_rows(~flag.isin(yes | no), "放假日", "「放假」只能填 是 或 否（空白 = 是）", errors)
+            off = ~flag.isin(no)
+        holidays = [d for d, o in zip(hd, off) if pd.notna(d) and o]
+        if "節日" in hdf.columns:
+            lab = hdf["節日"].where(hdf["節日"].notna(), "").astype(str).str.strip()
+            special = {d: l for d, l in zip(hd, lab) if pd.notna(d) and l}
 
     # 目前訂房
     otb = None
@@ -243,7 +263,7 @@ def read_workbook(file):
                                 "常見原因是取消訂房，或兩張表的截止日期不同。")
     elif otb is None:
         warnings.append("沒有「目前訂房」或「目前時段」：產生價格時會當作還沒有任何訂房。")
-    return dict(rooms=rooms, hist=h, holidays=holidays, otb=otb, cur=cur), warnings
+    return dict(rooms=rooms, hist=h, holidays=holidays, special=special, otb=otb, cur=cur), warnings
 
 
 # ---------------------------------------------------------------
@@ -276,15 +296,20 @@ class Model:
     notes: list = field(default_factory=list)
     alpha_hist: float = 400.0                  # 從歷史資料估的貝氏先驗強度
     level_hist: pd.DataFrame = None            # 歷史各年月的「實際 ÷ 模型」比例
+    special_eff: dict = field(default_factory=dict)      # {節日名稱: log 效果}
+    special_nights: dict = field(default_factory=dict)   # {節日名稱: 歷史資料中出現的晚數}
 
-    def ctrl(self, months, ntypes):
+    def ctrl(self, months, ntypes, labels=None):
         miss = sorted({int(m) for m in months} - set(self.month_eff))
         if miss:
             raise InputError(f"歷史資料裡沒有 {'、'.join(map(str, miss))} 月，無法預測這個月份的需求。")
-        return np.array([self.month_eff[int(m)] for m in months]) + self.night_eff[np.asarray(ntypes)]
+        z = np.array([self.month_eff[int(m)] for m in months]) + self.night_eff[np.asarray(ntypes)]
+        if labels is not None:
+            z = z + np.array([self.special_eff.get(l, 0.0) for l in labels])
+        return z
 
 
-def _design(months, ntypes, month_levels, night_cols):
+def _design(months, ntypes, month_levels, night_cols, labels=None, special_levels=()):
     cols = [(months == m).astype(float) for m in month_levels[1:]]
     for c in night_cols:
         if c == "週末":
@@ -293,6 +318,8 @@ def _design(months, ntypes, month_levels, night_cols):
             cols.append((ntypes >= 2).astype(float))
         else:
             cols.append((ntypes == c).astype(float))
+    for lab in special_levels:                          # 節日：在月份、夜晚類型之上再乘一個倍數
+        cols.append((labels == lab).astype(float))
     return np.column_stack(cols) if cols else np.zeros((len(months), 0))
 
 
@@ -363,7 +390,7 @@ def _fit(P, quad, cap, start=None):
 def fit_model(data, progress=None):
     step = progress or (lambda frac, msg: None)
     rooms, h = data["rooms"], data["hist"]
-    cal = Calendar(data["holidays"])
+    cal = Calendar(data["holidays"], data.get("special"))
     names = list(rooms["房型"])
     K = len(names)
     cap = rooms["房量"].to_numpy(float)
@@ -382,6 +409,10 @@ def fit_model(data, progress=None):
     dmap = {d: k for k, d in enumerate(udates)}
     di = h["入住日"].map(dmap).to_numpy(int)
     months, ntypes = m_u[di], n_u[di]
+    lab_u = cal.labels(udates)
+    labels = lab_u[di]
+    special_levels = sorted(set(lab_u) - {""})
+    special_nights = {l: int((lab_u == l).sum()) for l in special_levels}
 
     p_bar = np.array([np.round(price[r == i].mean(), 1) for i in range(K)])
     p_lo = np.array([price[r == i].min() for i in range(K)])
@@ -402,11 +433,11 @@ def fit_model(data, progress=None):
 
     # (1) 夜晚類型：交互作用檢定（需要四種夜晚都出現過）
     add_cols = [c for c, ok in [("週末", present & {1, 3}), ("假日夜", present & {2, 3})] if ok]
-    P_add = dict(base_P, Z=_design(months, ntypes, month_levels, add_cols))
+    P_add = dict(base_P, Z=_design(months, ntypes, month_levels, add_cols, labels, special_levels))
     step(0.1, "估計模型（沒有交互作用）…")
     full_add, nll_add = _fit(P_add, allq, cap)
     if {1, 2, 3} <= present:
-        P_int = dict(base_P, Z=_design(months, ntypes, month_levels, [1, 2, 3]))
+        P_int = dict(base_P, Z=_design(months, ntypes, month_levels, [1, 2, 3], labels, special_levels))
         step(0.3, "估計模型（有交互作用）…")
         full_int, nll_int = _fit(P_int, allq, cap)
         p_int = float(stats.chi2.sf(max(2 * (nll_add - nll_int), 0), 1))
@@ -449,6 +480,10 @@ def fit_model(data, progress=None):
     else:
         w, hol = ng.get("週末", 0.0), ng.get("假日夜", 0.0)
         night_eff = np.array([0.0, w, hol, w + hol])
+    special_eff = dict(zip(special_levels, gam[nm + len(night_cols):]))
+    few = [f"{l}（{n} 晚）" for l, n in special_nights.items() if n < 3]
+    if few:
+        notes.append(f"這些節日在歷史資料中出現的晚數很少，效果估計不穩定：{'、'.join(few)}。")
     for k in (1, 2, 3):
         if k not in present:
             notes.append(f"歷史資料沒有「{NIGHT_TYPES[k]}」，這類晚上的效果是推估的。")
@@ -478,7 +513,8 @@ def fit_model(data, progress=None):
                  month_eff=month_eff, night_eff=night_eff, interact=interact, p_int=p_int,
                  quad=quad, pvals=pvals, checks=checks, n_spells=len(h),
                  cens_rate=float(np.mean(y >= R)), hist_range=(min(udates), max(udates)), notes=notes,
-                 alpha_hist=alpha_hist, level_hist=level_hist)
+                 alpha_hist=alpha_hist, level_hist=level_hist,
+                 special_eff=special_eff, special_nights=special_nights)
 
 
 def model_tables(m):
@@ -501,6 +537,14 @@ def model_tables(m):
                           f"需求是 {base} 月的幾倍": [round(float(np.exp(m.month_eff[k])), 2)
                                                 for k in sorted(m.month_eff)]})
     return price, night, month
+
+
+def special_table(m):
+    if not m.special_eff:
+        return None
+    return pd.DataFrame({"節日": list(m.special_eff),
+                         "需求是同類型晚上的幾倍": [round(float(np.exp(v)), 2) for v in m.special_eff.values()],
+                         "歷史資料中的晚數": [m.special_nights.get(l, 0) for l in m.special_eff]})
 
 
 # ---------------------------------------------------------------
@@ -560,7 +604,7 @@ def update_level(model, holidays, otb, today, dates, alpha, spells=None):
     """
     dates = list(dates)
     K, names, cap = len(model.names), model.names, model.cap
-    cal = Calendar(holidays)
+    cal = _as_cal(holidays)
     ri = {n: i for i, n in enumerate(names)}
     CUM = np.cumsum(np.exp(XH @ model.H.T).T, axis=1)                  # K × 91，CUM[i, L] = Σ_{l≤L}
     CUM0 = np.concatenate([np.zeros((K, 1)), CUM], 1)                   # CUM0[i, L+1] = Σ_{l≤L}
@@ -571,7 +615,7 @@ def update_level(model, holidays, otb, today, dates, alpha, spells=None):
         if len(sp):
             sd = list(sp["入住日"])
             months, ntypes = cal.features(sd)
-            z = model.ctrl(months, ntypes)
+            z = model.ctrl(months, ntypes, cal.labels(sd))
             r = sp["房型"].map(ri).to_numpy(int)
             L_now = np.array([(d - today).days for d in sd])
             Ls = np.minimum(sp["開始提前天數"].to_numpy(int), LMAX)
@@ -605,7 +649,7 @@ def update_level(model, holidays, otb, today, dates, alpha, spells=None):
         if "目前牌價" in row.index and pd.notna(row["目前牌價"]):
             px[di[row["入住日"]], ri[row["房型"]]] = row["目前牌價"] / 1000
     months, ntypes = cal.features(dates)
-    z = model.ctrl(months, ntypes)
+    z = model.ctrl(months, ntypes, cal.labels(dates))
     L_now = np.array([(d - today).days for d in dates])
     # 已經過去的提前天數：L_now+1 … 90（入住日已過則為 0 … 90）
     start_L = np.clip(L_now + 1, 0, LMAX + 1)
@@ -648,10 +692,14 @@ def price_range(model, holidays, start, end, today, otb, step, costs, bounds=Non
     D = len(dates)
     in_P = np.isin(dates, P_dates)
     in_W = np.isin(dates, W_dates)
-    cal = Calendar(holidays)
+    cal = _as_cal(holidays)
     months, ntypes = cal.features(dates)
-    z = model.ctrl(months, ntypes)
+    labs = cal.labels(dates)
+    z = model.ctrl(months, ntypes, labs)
     warnings = []
+    unknown = sorted({l for l in labs if l and l not in model.special_eff})
+    if unknown:
+        warnings.append(f"這些節日在歷史資料中沒有出現過，無法估計效果，暫以 1 倍計算：{'、'.join(unknown)}。")
 
     # 目前訂房
     sold, rev = np.zeros((D, K)), np.zeros((D, K))
@@ -762,6 +810,8 @@ def price_range(model, holidays, start, end, today, otb, step, costs, bounds=Non
     table = pd.DataFrame({"入住日": [d.isoformat() for d in dates],
                           "星期": [WEEKDAYS[d.weekday()] for d in dates],
                           "夜晚類型": [NIGHT_TYPES[t] for t in ntypes]})
+    if any(labs):
+        table["節日"] = list(labs)
     if use_target:
         table["用途"] = usage
     for i, n in enumerate(names):
@@ -847,6 +897,9 @@ def to_excel(result, model):
         price.to_excel(xw, sheet_name="模型_價格效果", index=False)
         night.to_excel(xw, sheet_name="模型_夜晚類型", index=False)
         month.to_excel(xw, sheet_name="模型_月份", index=False)
+        sp = special_table(model)
+        if sp is not None:
+            sp.to_excel(xw, sheet_name="模型_節日", index=False)
         for ws in xw.book.worksheets:
             for row in ws.iter_rows():
                 for c in row:

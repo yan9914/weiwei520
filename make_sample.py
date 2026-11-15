@@ -32,6 +32,19 @@ HOLIDAYS = sorted(set(
     + days("2026-01-01", "2026-01-01") + days("2026-02-14", "2026-02-22") + days("2026-02-27", "2026-02-28")
     + days("2026-04-03", "2026-04-06") + days("2026-06-19", "2026-06-19") + days("2026-09-25", "2026-09-25")
     + days("2026-10-09", "2026-10-10")))
+
+# 節日：春節依日序分 4 類（每年日期不同，但同類性質相近）；跨年夜不放假（放假 = 否），只標記節日
+SPECIAL = {}
+for eve, first3, after, last in [
+        ("2024-02-09", ("2024-02-10", "2024-02-12"), ("2024-02-13", "2024-02-13"), "2024-02-14"),
+        ("2025-01-28", ("2025-01-29", "2025-01-31"), ("2025-02-01", "2025-02-01"), "2025-02-02"),
+        ("2026-02-16", ("2026-02-17", "2026-02-19"), ("2026-02-20", "2026-02-21"), "2026-02-22")]:
+    SPECIAL[dt.date.fromisoformat(eve)] = "除夕"
+    SPECIAL.update({d: "初一～初三" for d in days(*first3)})
+    SPECIAL.update({d: "初四～收假" for d in days(*after)})
+    SPECIAL[dt.date.fromisoformat(last)] = "收假前一晚"
+NOT_OFF = {dt.date(y, 12, 31): "跨年" for y in (2024, 2025, 2026)}
+SPECIAL.update(NOT_OFF)
 cal = Calendar(HOLIDAYS)
 
 leads = np.arange(LMAX + 1)
@@ -42,6 +55,8 @@ true_b1 = -1 / p_bar
 true_b2 = np.array([-0.02, -0.01, 0.0, -0.005, 0.003, 0.0])
 TRUE_MONTH = np.array([0.0, 0.1, -0.5, 0.0, -0.2, -0.1, 0.3, 0.35, -0.15, 0.05, -0.4, 0.1])
 TRUE_NIGHT = np.array([0.0, 0.4, 0.5, 0.55])
+TRUE_SPECIAL = {"除夕": np.log(0.5), "初一～初三": np.log(1.6), "初四～收假": np.log(1.1),
+                "收假前一晚": np.log(0.6), "跨年": np.log(1.5)}   # 在夜晚類型之上再乘的倍數
 
 
 # 每個「年-月」的市場需求衝擊（歷史模型看不到）：歷史月份隨機 ±15% 左右；
@@ -52,7 +67,7 @@ SHOCK[(2026, 3)] = 1.25
 
 def rate(i, p, d, L):
     pc = p - p_bar[i]
-    z = TRUE_MONTH[d.month - 1] + TRUE_NIGHT[cal.night_type(d)]
+    z = TRUE_MONTH[d.month - 1] + TRUE_NIGHT[cal.night_type(d)] + TRUE_SPECIAL.get(SPECIAL.get(d), 0.0)
     return SHOCK.get((d.year, d.month), 1.0) * np.exp(true_a[i] + true_b1[i] * pc + true_b2[i] * pc**2
                                                        + true_h[L] + z)
 
@@ -126,7 +141,11 @@ readme = pd.DataFrame({"說明": [
     "  開始提前天數 / 結束提前天數：這個價格從入住前幾天掛到入住前幾天（含），例如 30 和 15。",
     "  訂房數：這段期間收到幾間訂房；時段開始剩餘房數：這段開始時還剩幾間可賣。",
     "  賣光之後的時段不要列出來（不能當成需求是 0）。",
-    "放假日：國定假日與補假日期（週六日不用列）。⚠ 範例裡的日期是模擬的，請換成官方行事曆。",
+    "放假日：國定假日與補假日期（一般週六日不用列）。⚠ 範例裡的日期是模擬的，請換成官方行事曆。",
+    "  節日（選填）：替特殊的晚上取名字，例如 除夕、初一～初三、初四～收假、收假前一晚。不同年份同名的日子共用同一個效果。",
+    "  屬於節日的週末也要列出來並填節日名稱；要替未來定價的節日日期也要先填好（模型不會自己推算農曆）。",
+    "  放假（選填）：是／否，空白 = 是。不放假的特殊日子（例如跨年夜、演唱會）填「否」，只標記節日效果、不當成放假。",
+    "  名稱要一致，例如「除夕」和「除夕夜」會被當成兩個不同的節日。",
     "目前時段（建議提供）：格式和「歷史時段」完全相同，換成要定價的入住日，記錄從開賣到今天的每一段牌價與訂房數。",
     "  最後一段的結束提前天數 = 今天距入住日的天數。沒有賣出的入住日也要列出它的時段（訂房數 = 0）。",
     "  有這張表時，貝氏更新會逐段精確計算；也可以由它推算已售房數、已售營收（訂房數 × 牌價）、目前牌價。",
@@ -141,7 +160,10 @@ with pd.ExcelWriter("sample_data.xlsx", engine="openpyxl") as xw:
     readme.to_excel(xw, sheet_name="說明", index=False)
     rooms.to_excel(xw, sheet_name="房型", index=False)
     hist.to_excel(xw, sheet_name="歷史時段", index=False)
-    pd.DataFrame({"日期": HOLIDAYS}).to_excel(xw, sheet_name="放假日", index=False)
+    hol = pd.DataFrame({"日期": sorted(set(HOLIDAYS) | set(NOT_OFF))})
+    hol["節日"] = [SPECIAL.get(d, "") for d in hol["日期"]]
+    hol["放假"] = ["否" if d in NOT_OFF else "" for d in hol["日期"]]
+    hol.to_excel(xw, sheet_name="放假日", index=False)
     cur.to_excel(xw, sheet_name="目前時段", index=False)
     otb.to_excel(xw, sheet_name="目前訂房", index=False)
 print(f"sample_data.xlsx：歷史時段 {len(hist):,} 列，目前時段 {len(cur)} 列，目前訂房 {len(otb)} 列（今天 = {today}）")
