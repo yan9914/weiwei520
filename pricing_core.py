@@ -82,7 +82,8 @@ def _as_cal(holidays):
 # ---------------------------------------------------------------
 SHEETS = {
     "房型": ["房型", "房量", "成本"],
-    "歷史時段": ["房型", "入住日", "牌價", "開始提前天數", "結束提前天數", "訂房數", "時段開始剩餘房數"],
+    # 另需一組掛牌期間欄位：「掛牌開始日期、掛牌結束日期」或「開始提前天數、結束提前天數」
+    "歷史時段": ["房型", "入住日", "牌價", "訂房數", "時段開始剩餘房數"],
     "放假日": ["日期"],
     "目前訂房": ["入住日", "房型", "已售房數"],     # 另需「已售營收」或「目前牌價」至少一欄（建議兩欄都有）
 }
@@ -100,27 +101,64 @@ def _to_date(s):
 
 
 SPELL_COLS = ["牌價", "開始提前天數", "結束提前天數", "訂房數", "時段開始剩餘房數"]
+DATE_COLS = ["掛牌開始日期", "掛牌結束日期"]
+LEAD_COLS = ["開始提前天數", "結束提前天數"]
 
 
 def _parse_spells(df, sheet, names, capmap, errors, warnings):
-    """檢查「歷史時段」或「目前時段」（兩者格式相同）。"""
+    """
+    檢查「歷史時段」或「目前時段」（兩者格式相同）。
+    掛牌期間可以用日期（掛牌開始日期、掛牌結束日期，含頭尾）或提前天數；兩種都有時以日期為準。
+    日期會換算成提前天數：開始提前天數 = 入住日 − 掛牌開始日期，結束提前天數 = 入住日 − 掛牌結束日期。
+    """
     h = df.copy()
+    has_date = all(c in h.columns for c in DATE_COLS)
+    has_lead = all(c in h.columns for c in LEAD_COLS)
+    if not (has_date or has_lead):
+        errors.append(f"「{sheet}」需要「掛牌開始日期、掛牌結束日期」兩欄（或舊格式的「開始提前天數、結束提前天數」）")
+        return h
     h["房型"] = h["房型"].astype(str).str.strip()
     h["入住日"] = _to_date(h["入住日"])
-    for c in SPELL_COLS:
-        h[c] = pd.to_numeric(h[c], errors="coerce")
     _bad_rows(~h["房型"].isin(names), sheet, "房型不在「房型」工作表中", errors)
     _bad_rows(h["入住日"].isna(), sheet, "入住日不是有效日期", errors)
-    _bad_rows(h[SPELL_COLS].isna().any(axis=1), sheet, "數值欄位空白或不是數字", errors)
+
+    if has_date:
+        stay = pd.to_datetime(h["入住日"], errors="coerce")
+        start = pd.to_datetime(h["掛牌開始日期"], errors="coerce")
+        end = pd.to_datetime(h["掛牌結束日期"], errors="coerce")
+        bad_date = start.isna() | end.isna()
+        _bad_rows(bad_date, sheet, "掛牌開始日期或掛牌結束日期不是有效日期", errors)
+        _bad_rows(~bad_date & (start > end), sheet, "掛牌開始日期晚於掛牌結束日期", errors)
+        _bad_rows(~bad_date & (end > stay), sheet, "掛牌結束日期晚於入住日", errors)
+        h["開始提前天數"] = (stay - start).dt.days
+        h["結束提前天數"] = (stay - end).dt.days
+        h.loc[bad_date, LEAD_COLS] = 0                      # 錯誤已回報，避免重複訊息
+        num_check = ["牌價", "訂房數", "時段開始剩餘房數"]
+    else:
+        num_check = SPELL_COLS
+    for c in SPELL_COLS:
+        h[c] = pd.to_numeric(h[c], errors="coerce")
+    _bad_rows(h[num_check].isna().any(axis=1), sheet, "數值欄位空白或不是數字", errors)
+    if not has_date:
+        _bad_rows((h["結束提前天數"] < 0) | (h["開始提前天數"] < h["結束提前天數"]), sheet,
+                  "提前天數必須 ≥ 0，且開始 ≥ 結束", errors)
     _bad_rows(h["牌價"] <= 0, sheet, "牌價必須大於 0", errors)
-    _bad_rows((h["結束提前天數"] < 0) | (h["開始提前天數"] < h["結束提前天數"]), sheet,
-              "提前天數必須 ≥ 0，且開始 ≥ 結束", errors)
     _bad_rows((h["訂房數"] < 0) | (h["訂房數"] > h["時段開始剩餘房數"]), sheet,
               "訂房數必須介於 0 和剩餘房數之間", errors)
     _bad_rows((h["時段開始剩餘房數"] < 1) | (h["時段開始剩餘房數"] > h["房型"].map(capmap)), sheet,
               "剩餘房數必須介於 1 和房量之間", errors)
     if (h["開始提前天數"] > LMAX).any():
-        warnings.append(f"「{sheet}」有時段的開始提前天數超過 {LMAX} 天，超過的部分會視為第 {LMAX} 天。")
+        warnings.append(f"「{sheet}」有時段的掛牌開始日期早於入住日 {LMAX} 天以上，超過的部分會視為第 {LMAX} 天。")
+
+    # 同一入住日、同一房型的時段不能重疊（結束日期含當天，下一段應從隔天開始）
+    ok = h[LEAD_COLS + ["入住日"]].notna().all(axis=1)
+    o = h[ok].sort_values(["入住日", "房型", "開始提前天數"], ascending=[True, True, False])
+    same = (o["入住日"] == o["入住日"].shift()) & (o["房型"] == o["房型"].shift())
+    overlap = same & (o["開始提前天數"] >= o["結束提前天數"].shift())
+    if overlap.any():
+        ex = "、".join(f"{r.入住日} {r.房型}" for r in o[overlap].head(3).itertuples())
+        warnings.append(f"「{sheet}」有 {int(overlap.sum())} 個時段和前一段的掛牌期間重疊（例如 {ex}）。"
+                        "掛牌結束日期包含當天，下一段應該從隔天開始；重疊的天數會被重複計算。")
     return h
 
 
@@ -184,7 +222,7 @@ def read_workbook(file):
     if "目前時段" in xls.sheet_names:
         cdf = pd.read_excel(xls, sheet_name="目前時段")
         cdf.columns = [str(c).strip() for c in cdf.columns]
-        miss = [c for c in SHEETS["歷史時段"] if c not in cdf.columns]
+        miss = [c for c in SHEETS["歷史時段"] if c not in cdf.columns]  # 掛牌期間欄位在 _parse_spells 檢查
         if miss:
             errors.append(f"「目前時段」缺少欄位：{'、'.join(miss)}")
         else:
